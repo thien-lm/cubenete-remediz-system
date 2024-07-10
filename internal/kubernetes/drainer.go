@@ -23,7 +23,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	core "k8s.io/api/core/v1"
-	policy "k8s.io/api/policy/v1beta1"
+	// policy "k8s.io/api/policy/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -342,9 +342,10 @@ func (d *APICordonDrainer) getPods(node string) ([]core.Pod, error) {
 	}
 	return include, nil
 }
-
+//i will delete pod instead of evict
 func (d *APICordonDrainer) evict(p core.Pod, abort <-chan struct{}, e chan<- error) {
-	gracePeriod := int64(d.maxGracePeriod.Seconds())
+	// gracePeriod := int64(d.maxGracePeriod.Seconds())
+	gracePeriod := int64(0)
 	if p.Spec.TerminationGracePeriodSeconds != nil && *p.Spec.TerminationGracePeriodSeconds < gracePeriod {
 		gracePeriod = *p.Spec.TerminationGracePeriodSeconds
 	}
@@ -354,10 +355,7 @@ func (d *APICordonDrainer) evict(p core.Pod, abort <-chan struct{}, e chan<- err
 			e <- errors.New("pod eviction aborted")
 			return
 		default:
-			err := d.c.CoreV1().Pods(p.GetNamespace()).Evict(&policy.Eviction{
-				ObjectMeta:    meta.ObjectMeta{Namespace: p.GetNamespace(), Name: p.GetName()},
-				DeleteOptions: &meta.DeleteOptions{GracePeriodSeconds: &gracePeriod},
-			})
+			err := d.c.CoreV1().Pods(p.GetNamespace()).Delete(p.GetName(), &meta.DeleteOptions{GracePeriodSeconds: &gracePeriod})
 			switch {
 			// The eviction API returns 429 Too Many Requests if a pod
 			// cannot currently be evicted, for example due to a pod

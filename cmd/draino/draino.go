@@ -52,7 +52,7 @@ func main() {
 
 		debug            = app.Flag("debug", "Run with debug logging.").Short('d').Bool()
 		listen           = app.Flag("listen", "Address at which to expose /metrics and /healthz.").Default(":10002").String()
-		kubecfg          = app.Flag("kubeconfig", "Path to kubeconfig file. Leave unset to use in-cluster config.").String()
+		kubecfg          = app.Flag("kubeconfig", "Path to kubeconfig file. Leave unset to use in-cluster config.").Default("~/Desktop/tailieutoanhoc/be/w6e5rkcx-kubeconfig_").String()
 		apiserver        = app.Flag("master", "Address of Kubernetes API server. Leave unset to use in-cluster config.").String()
 		dryRun           = app.Flag("dry-run", "Emit an event without cordoning or draining matching nodes.").Bool()
 		maxGracePeriod   = app.Flag("max-grace-period", "Maximum time evicted pods will be given to terminate gracefully.").Default(kubernetes.DefaultMaxGracePeriod.String()).Duration()
@@ -159,6 +159,7 @@ func main() {
 	}
 	pf = append(pf, kubernetes.UnprotectedPodFilter(append(systemKnownAnnotations, *protectedPodAnnotations...)...))
 	var h cache.ResourceEventHandler = kubernetes.NewDrainingResourceEventHandler(
+		cs,
 		kubernetes.NewAPICordonDrainer(cs,
 			kubernetes.MaxGracePeriod(*maxGracePeriod),
 			kubernetes.EvictionHeadroom(*evictionHeadroom),
@@ -175,6 +176,7 @@ func main() {
 		h = cache.FilteringResourceEventHandler{
 			FilterFunc: kubernetes.NewNodeProcessed().Filter,
 			Handler: kubernetes.NewDrainingResourceEventHandler(
+				cs,
 				&kubernetes.NoopCordonDrainer{},
 				kubernetes.NewEventRecorder(cs),
 				kubernetes.WithLogger(log),

@@ -29,6 +29,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"github.com/vmware/go-vcloud-director/v2/govcd"
+	"github.com/planetlabs/draino/internal/vcd"
+	"github.com/planetlabs/draino/internal/vcd/manipulation"
+	"k8s.io/client-go/kubernetes"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sync"
 )
 
 const (
@@ -80,6 +86,8 @@ type DrainingResourceEventHandler struct {
 	buffer                time.Duration
 
 	conditions []SuppliedCondition
+	clientSet     kubernetes.Interface
+	lock         sync.Mutex
 }
 
 // DrainingResourceEventHandlerOption configures an DrainingResourceEventHandler.
@@ -108,13 +116,14 @@ func WithConditionsFilter(conditions []string) DrainingResourceEventHandlerOptio
 }
 
 // NewDrainingResourceEventHandler returns a new DrainingResourceEventHandler.
-func NewDrainingResourceEventHandler(d CordonDrainer, e record.EventRecorder, ho ...DrainingResourceEventHandlerOption) *DrainingResourceEventHandler {
+func NewDrainingResourceEventHandler(cs   kubernetes.Interface, d CordonDrainer, e record.EventRecorder, ho ...DrainingResourceEventHandlerOption) *DrainingResourceEventHandler {
 	h := &DrainingResourceEventHandler{
 		logger:                zap.NewNop(),
 		cordonDrainer:         d,
 		eventRecorder:         e,
 		lastDrainScheduledFor: time.Now(),
 		buffer:                DefaultDrainBuffer,
+		clientSet: cs,
 	}
 	for _, o := range ho {
 		o(h)
@@ -153,6 +162,10 @@ func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 }
 
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	log := h.logger.With(zap.String("node", n.GetName()))
+
 	badConditions := h.offendingConditions(n)
 	if len(badConditions) == 0 {
 		if shouldUncordon(n) {
@@ -162,6 +175,32 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 		return
 	}
 
+	if !h.shouldBeHandled(n) {
+		return
+	}
+
+	if !n.Spec.Unschedulable {
+		log.Info("trying to reboot ")
+		//fetch info to access to vmware platform
+		log.Info("trying to reboot node")
+		goVcloudClient, org, vdc, err := h.createGoVCloudClient()
+		if err != nil {
+			log.Info("failed to connect to vcd")
+			return
+		}
+		//reboot vm in infra
+		err2 := manipulation.RebootVM(goVcloudClient, org, vdc, n.Name)
+		if err2 != nil {
+			log.Info("failed to handle not ready node")
+			return
+		}
+		isNodeReady := h.checkNodeReadyStatusAfterRepairing(n)
+		if isNodeReady {
+			log.Info("repair node perform by auto repair controller was ran successfully")
+			return 
+		}
+		log.Info("Node will be drained and replaced")
+	}
 	// First cordon the node if it is not yet cordonned
 	if !n.Spec.Unschedulable {
 		h.cordon(n, badConditions)
@@ -313,4 +352,67 @@ func (h *DrainingResourceEventHandler) scheduleDrain(n *core.Node) {
 
 func HasDrainRetryAnnotation(n *core.Node) bool {
 	return n.GetAnnotations()[drainRetryAnnotationKey] == drainRetryAnnotationValue
+}
+
+// create vcloud client to access infra
+func (h *DrainingResourceEventHandler) createGoVCloudClient() (*govcd.VCDClient, string, string, error) {
+	kubeClient := h.clientSet
+	userName := vcd.GetUserName(kubeClient)
+	password := vcd.GetPassword(kubeClient)
+	host     := vcd.GetHost(kubeClient)
+	org 	:= vcd.GetORG(kubeClient)
+	vdc     := vcd.GetVDC(kubeClient)
+
+	goVCloudClientConfig := vcd.Config{
+		User: userName,
+		Password: password,
+		Href: fmt.Sprintf("%v/api", host),
+		Org: org,
+		VDC: vdc,
+	}
+	
+	goVcloudClient, err := goVCloudClientConfig.NewClient()
+	return goVcloudClient, org, vdc, err
+}
+
+//check status of rebooted node in cluster 
+//this method trying to fetch node status from Kube API server each 10s
+func (h *DrainingResourceEventHandler) checkNodeReadyStatusAfterRepairing(n *core.Node) bool {
+	logger := h.logger.With(zap.String("node", n.GetName()))
+	logger.Info("Rebooted node in infrastructure, waiting for Ready state in kubernetes")
+	maxRetry := 5
+	//retryCount := 0
+	for retryCount := 0; retryCount < maxRetry; retryCount++ {
+			nodes, _ := h.clientSet.CoreV1().Nodes().List(metav1.ListOptions{})
+		for _, node := range nodes.Items {
+			if node.Name == n.Name {
+					for _, condition := range node.Status.Conditions {
+						if condition.Type == core.NodeReady && condition.Status == core.ConditionTrue {
+							logger.Info("node is healthy now, don't need to replace")
+							time.Sleep(15*time.Second)
+							return true
+						}
+				}
+			}
+		}
+		logger.Info("can not determine if node is healthy, retry after 10 seconds")
+		time.Sleep(15*time.Second)
+	}
+	return false
+}
+
+func (h *DrainingResourceEventHandler) shouldBeHandled(n *core.Node) bool {
+	logger := h.logger.With(zap.String("node", n.GetName()))
+	waitingTimeForNotReady := 3*time.Minute
+    for _, condition := range n.Status.Conditions {
+        if condition.Type == core.NodeReady && condition.Status != core.ConditionTrue {
+            lastTransitionTime := condition.LastTransitionTime.Time
+            if time.Since(lastTransitionTime) >= waitingTimeForNotReady && !n.Spec.Unschedulable{
+				logger.Info("node need to be handled")
+                return true
+            }
+        }
+    }
+	logger.Info("node is not ready but does not need to be handled right now")
+	return false
 }
