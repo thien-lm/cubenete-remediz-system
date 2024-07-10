@@ -178,46 +178,50 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	if !h.shouldBeHandled(n) {
 		return
 	}
+	if vcd.GetRebootingPrivilege(h.clientSet) {
+		if !n.Spec.Unschedulable {
+			log.Info("trying to reboot ")
+			//fetch info to access to vmware platform
+			log.Info("trying to reboot node")
+			goVcloudClient, org, vdc, err := h.createGoVCloudClient()
+			if err != nil {
+				log.Info("failed to connect to vcd")
+				return
+			}
+			//reboot vm in infra
+			err2 := manipulation.RebootVM(goVcloudClient, org, vdc, n.Name)
+			if err2 != nil {
+				log.Info("failed to handle not ready node")
+				return
+			}
+			isNodeReady := h.checkNodeReadyStatusAfterRepairing(n)
+			if isNodeReady {
+				log.Info("repair node perform by auto repair controller was ran successfully")
+				return 
+			}
+			log.Info("Node will be drained and replaced")
+		}
+	}
+	//if user allow us to replace node, run those code
+	if vcd.GetReplacingPrivilege(h.clientSet) {
+		// First cordon the node if it is not yet cordonned
+		if !n.Spec.Unschedulable {
+			h.cordon(n, badConditions)
+		}
 
-	if !n.Spec.Unschedulable {
-		log.Info("trying to reboot ")
-		//fetch info to access to vmware platform
-		log.Info("trying to reboot node")
-		goVcloudClient, org, vdc, err := h.createGoVCloudClient()
-		if err != nil {
-			log.Info("failed to connect to vcd")
+		// Let's ensure that a drain is scheduled
+		hasSChedule, failedDrain := h.drainScheduler.HasSchedule(n.GetName())
+		if !hasSChedule {
+			h.scheduleDrain(n)
 			return
 		}
-		//reboot vm in infra
-		err2 := manipulation.RebootVM(goVcloudClient, org, vdc, n.Name)
-		if err2 != nil {
-			log.Info("failed to handle not ready node")
+
+		// Is there a request to retry a failed drain activity. If yes reschedule drain
+		if failedDrain && HasDrainRetryAnnotation(n) {
+			h.drainScheduler.DeleteSchedule(n.GetName())
+			h.scheduleDrain(n)
 			return
 		}
-		isNodeReady := h.checkNodeReadyStatusAfterRepairing(n)
-		if isNodeReady {
-			log.Info("repair node perform by auto repair controller was ran successfully")
-			return 
-		}
-		log.Info("Node will be drained and replaced")
-	}
-	// First cordon the node if it is not yet cordonned
-	if !n.Spec.Unschedulable {
-		h.cordon(n, badConditions)
-	}
-
-	// Let's ensure that a drain is scheduled
-	hasSChedule, failedDrain := h.drainScheduler.HasSchedule(n.GetName())
-	if !hasSChedule {
-		h.scheduleDrain(n)
-		return
-	}
-
-	// Is there a request to retry a failed drain activity. If yes reschedule drain
-	if failedDrain && HasDrainRetryAnnotation(n) {
-		h.drainScheduler.DeleteSchedule(n.GetName())
-		h.scheduleDrain(n)
-		return
 	}
 }
 
