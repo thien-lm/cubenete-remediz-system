@@ -47,7 +47,7 @@ func NewNodeWatch(c kubernetes.Interface, rs ...cache.ResourceEventHandler) *Nod
 		ListFunc:  func(o meta.ListOptions) (runtime.Object, error) { return c.CoreV1().Nodes().List(o) },
 		WatchFunc: func(o meta.ListOptions) (watch.Interface, error) { return c.CoreV1().Nodes().Watch(o) },
 	}
-	i := cache.NewSharedInformer(lw, &core.Node{}, 30*time.Minute)
+	i := cache.NewSharedInformer(lw, &core.Node{}, 4*time.Minute)
 	for _, r := range rs {
 		i.AddEventHandler(r)
 	}

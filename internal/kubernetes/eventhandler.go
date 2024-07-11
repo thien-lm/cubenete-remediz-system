@@ -115,6 +115,12 @@ func WithConditionsFilter(conditions []string) DrainingResourceEventHandlerOptio
 	}
 }
 
+// func WithTimeFilter(clientSet kubernetes.Interface) DrainingResourceEventHandlerOption {
+// 	return func(h *DrainingResourceEventHandler) {
+// 		h.conditions = ParseConditions(conditions)
+// 	}
+// }
+
 // NewDrainingResourceEventHandler returns a new DrainingResourceEventHandler.
 func NewDrainingResourceEventHandler(cs   kubernetes.Interface, d CordonDrainer, e record.EventRecorder, ho ...DrainingResourceEventHandlerOption) *DrainingResourceEventHandler {
 	h := &DrainingResourceEventHandler{
@@ -162,12 +168,19 @@ func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 }
 
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
-	h.lock.Lock()
-	defer h.lock.Unlock()
+	// h.lock.Lock()
+	// defer h.lock.Unlock()
 	log := h.logger.With(zap.String("node", n.GetName()))
 
 	badConditions := h.offendingConditions(n)
 	if len(badConditions) == 0 {
+		// delete the annotation
+		if _, ok := n.Annotations["RepairByRebootingSucceed"]; ok {
+			delete(n.Annotations, "RepairByRebootingSucceed")
+			_, _ = h.clientSet.CoreV1().Nodes().Update(n)
+			log.Info("removed rebooting annotation for this node")
+		}
+
 		if shouldUncordon(n) {
 			h.drainScheduler.DeleteSchedule(n.GetName())
 			h.uncordon(n)
@@ -178,7 +191,14 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	if !h.shouldBeHandled(n) {
 		return
 	}
-	if vcd.GetRebootingPrivilege(h.clientSet) {
+
+	_, ok := n.Annotations["RepairByRebootingSucceed"]
+
+	if ok {
+		log.Info("This node was rebooted but the node state is still NotReady, skipping rebooting node")
+	}
+
+	if !ok && vcd.GetRebootingPrivilege(h.clientSet) {
 		if !n.Spec.Unschedulable {
 			log.Info("trying to reboot ")
 			//fetch info to access to vmware platform
@@ -186,12 +206,22 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			goVcloudClient, org, vdc, err := h.createGoVCloudClient()
 			if err != nil {
 				log.Info("failed to connect to vcd")
+				n.Annotations["RepairByRebootingSucceed"] = "false"
+				_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+				if err != nil {
+					panic(err)
+				}
 				return
 			}
 			//reboot vm in infra
 			err2 := manipulation.RebootVM(goVcloudClient, org, vdc, n.Name)
 			if err2 != nil {
-				log.Info("failed to handle not ready node")
+				log.Info("failed to reboot node")
+				n.Annotations["RepairByRebootingSucceed"] = "false"
+				_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+				if err != nil {
+					panic(err)
+				}
 				return
 			}
 			isNodeReady := h.checkNodeReadyStatusAfterRepairing(n)
@@ -199,8 +229,18 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 				log.Info("repair node perform by auto repair controller was ran successfully")
 				return 
 			}
+			log.Info("Reboot node does not make it healthy again")
 			log.Info("Node will be drained and replaced")
+			//annotate node because rebooting does not solve node not ready issue
+			n.Annotations["RepairByRebootingSucceed"] = "false"
+			_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+			if err != nil {
+				panic(err)
+			}
+
 		}
+	} else {
+		log.Info("the problem on this node can not be solve by rebooting node")
 	}
 	//if user allow us to replace node, run those code
 	if vcd.GetReplacingPrivilege(h.clientSet) {
@@ -222,6 +262,8 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			h.scheduleDrain(n)
 			return
 		}
+	} else {
+		log.Info("This controller was not allowed to reboot this node")
 	}
 }
 
@@ -384,7 +426,7 @@ func (h *DrainingResourceEventHandler) createGoVCloudClient() (*govcd.VCDClient,
 func (h *DrainingResourceEventHandler) checkNodeReadyStatusAfterRepairing(n *core.Node) bool {
 	logger := h.logger.With(zap.String("node", n.GetName()))
 	logger.Info("Rebooted node in infrastructure, waiting for Ready state in kubernetes")
-	maxRetry := 5
+	maxRetry := 10
 	//retryCount := 0
 	for retryCount := 0; retryCount < maxRetry; retryCount++ {
 			nodes, _ := h.clientSet.CoreV1().Nodes().List(metav1.ListOptions{})
@@ -399,7 +441,7 @@ func (h *DrainingResourceEventHandler) checkNodeReadyStatusAfterRepairing(n *cor
 				}
 			}
 		}
-		logger.Info("can not determine if node is healthy, retry after 10 seconds")
+		logger.Info("can not determine if node is healthy, retry after 15 seconds")
 		time.Sleep(15*time.Second)
 	}
 	return false
