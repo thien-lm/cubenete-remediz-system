@@ -141,21 +141,39 @@ func NewDrainingResourceEventHandler(cs   kubernetes.Interface, d CordonDrainer,
 // OnAdd cordons and drains the added node.
 func (h *DrainingResourceEventHandler) OnAdd(obj interface{}) {
 	n, ok := obj.(*core.Node)
+
+	if strings.Contains(n.Name, "master") {
+		return 
+	}
 	if !ok {
 		return
 	}
-	h.HandleNode(n)
+	//fmt.Println("onAdd function was called", n.Name)
+	// go h.HandleNode(n)
+	return
 }
 
 // OnUpdate cordons and drains the updated node.
 func (h *DrainingResourceEventHandler) OnUpdate(_, newObj interface{}) {
-	h.OnAdd(newObj)
+	n, ok := newObj.(*core.Node)
+	if strings.Contains(n.Name, "master") {
+		return 
+	}
+	if !ok {
+		return
+	}
+	// fmt.Println("onUpdate function was called with node: ", n.Name)
+	// time.Sleep(1 *time.Minute)
+	go h.HandleNode(n)
 }
 
 // OnDelete does nothing. There's no point cordoning or draining deleted nodes.
 
 func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 	n, ok := obj.(*core.Node)
+	if strings.Contains(n.Name, "master") {
+		return 
+	}
 	if !ok {
 		d, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
@@ -172,12 +190,26 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	// defer h.lock.Unlock()
 	log := h.logger.With(zap.String("node", n.GetName()))
 
-	badConditions := h.offendingConditions(n)
+	if !h.shouldBeHandled(n) {
+		return
+	}	
+
+	time.Sleep(3*time.Minute)
+
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	currentNodeStatus, nodeNotFoundErr := h.clientSet.CoreV1().Nodes().Get(n.Name, metav1.GetOptions{})
+
+	if nodeNotFoundErr != nil{
+		log.Info("node is not in cluster anymore")
+	}
+
+	badConditions := h.offendingConditions(currentNodeStatus)
 	if len(badConditions) == 0 {
 		// delete the annotation
-		if _, ok := n.Annotations["RepairByRebootingSucceed"]; ok {
-			delete(n.Annotations, "RepairByRebootingSucceed")
-			_, _ = h.clientSet.CoreV1().Nodes().Update(n)
+		if _, ok := currentNodeStatus.Annotations["RepairByRebootingSucceed"]; ok {
+			delete(currentNodeStatus.Annotations, "RepairByRebootingSucceed")
+			_, _ = h.clientSet.CoreV1().Nodes().Update(currentNodeStatus)
 			log.Info("removed rebooting annotation for this node")
 		}
 
@@ -185,62 +217,67 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			h.drainScheduler.DeleteSchedule(n.GetName())
 			h.uncordon(n)
 		}
+		log.Info("Node was in bad condition but is healthy now")
 		return
 	}
 
-	if !h.shouldBeHandled(n) {
-		return
-	}
-
-	_, ok := n.Annotations["RepairByRebootingSucceed"]
+	_, ok := currentNodeStatus.Annotations["RepairByRebootingSucceed"]
 
 	if ok {
 		log.Info("This node was rebooted but the node state is still NotReady, skipping rebooting node")
 	}
-
 	if !ok && vcd.GetRebootingPrivilege(h.clientSet) {
-		if !n.Spec.Unschedulable {
-			log.Info("trying to reboot ")
+		if !currentNodeStatus.Spec.Unschedulable {
 			//fetch info to access to vmware platform
 			log.Info("trying to reboot node")
 			goVcloudClient, org, vdc, err := h.createGoVCloudClient()
 			if err != nil {
 				log.Info("failed to connect to vcd")
-				n.Annotations["RepairByRebootingSucceed"] = "false"
-				_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+				currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
+				_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
 				if err != nil {
 					panic(err)
 				}
 				return
 			}
 			//reboot vm in infra
-			err2 := manipulation.RebootVM(goVcloudClient, org, vdc, n.Name)
+			err2 := manipulation.RebootVM(goVcloudClient, org, vdc, currentNodeStatus.Name)
 			if err2 != nil {
-				log.Info("failed to reboot node")
-				n.Annotations["RepairByRebootingSucceed"] = "false"
-				_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
-				if err != nil {
-					panic(err)
+				//second chance
+				time.Sleep(60 * time.Second)
+				err3 := manipulation.RebootVM(goVcloudClient, org, vdc, currentNodeStatus.Name)
+				if err3 != nil{
+					//third chance
+					time.Sleep(60 * time.Second)
+					err4 := manipulation.RebootVM(goVcloudClient, org, vdc, currentNodeStatus.Name)
+					if err4 != nil{
+						log.Info("failed to reboot node")
+						currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
+						_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+						if err != nil {
+							panic(err)
+						}
+						return		
+					}			
 				}
-				return
 			}
-			isNodeReady := h.checkNodeReadyStatusAfterRepairing(n)
+			isNodeReady := h.checkNodeReadyStatusAfterRepairing(currentNodeStatus)
 			if isNodeReady {
 				log.Info("repair node perform by auto repair controller was ran successfully")
 				return 
 			}
-			log.Info("Reboot node does not make it healthy again")
+			log.Info("Rebooted this node but does not make it healthy again")
 			log.Info("Node will be drained and replaced")
 			//annotate node because rebooting does not solve node not ready issue
-			n.Annotations["RepairByRebootingSucceed"] = "false"
-			_, err = h.clientSet.CoreV1().Nodes().Patch(n.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+			currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
+			_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
 			if err != nil {
 				panic(err)
 			}
 
 		}
 	} else {
-		log.Info("the problem on this node can not be solve by rebooting node")
+		log.Info("the problem on this node can not be solve by rebooting")
 	}
 	//if user allow us to replace node, run those code
 	if vcd.GetReplacingPrivilege(h.clientSet) {
@@ -250,7 +287,7 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 		}
 
 		// Let's ensure that a drain is scheduled
-		hasSChedule, failedDrain := h.drainScheduler.HasSchedule(n.GetName())
+		hasSChedule, failedDrain := h.drainScheduler.HasSchedule(currentNodeStatus.GetName())
 		if !hasSChedule {
 			h.scheduleDrain(n)
 			return
@@ -258,13 +295,14 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 
 		// Is there a request to retry a failed drain activity. If yes reschedule drain
 		if failedDrain && HasDrainRetryAnnotation(n) {
-			h.drainScheduler.DeleteSchedule(n.GetName())
+			h.drainScheduler.DeleteSchedule(currentNodeStatus.GetName())
 			h.scheduleDrain(n)
 			return
 		}
 	} else {
-		log.Info("This controller was not allowed to reboot this node")
+		log.Info("Auto repair controller was not allowed to replace this node")
 	}
+	time.Sleep(20*time.Second) //waiting time for sync data
 }
 
 func (h *DrainingResourceEventHandler) offendingConditions(n *core.Node) []SuppliedCondition {
@@ -449,16 +487,16 @@ func (h *DrainingResourceEventHandler) checkNodeReadyStatusAfterRepairing(n *cor
 
 func (h *DrainingResourceEventHandler) shouldBeHandled(n *core.Node) bool {
 	logger := h.logger.With(zap.String("node", n.GetName()))
-	waitingTimeForNotReady := 3*time.Minute
+	// waitingTimeForNotReady := 3*time.Minute
     for _, condition := range n.Status.Conditions {
         if condition.Type == core.NodeReady && condition.Status != core.ConditionTrue {
-            lastTransitionTime := condition.LastTransitionTime.Time
-            if time.Since(lastTransitionTime) >= waitingTimeForNotReady && !n.Spec.Unschedulable{
+            // lastTransitionTime := condition.LastTransitionTime.Time
+            if  !n.Spec.Unschedulable{
 				logger.Info("node need to be handled")
                 return true
             }
         }
     }
-	logger.Info("node is not ready but does not need to be handled right now")
+	// logger.Info("node does not need to be handled")
 	return false
 }
