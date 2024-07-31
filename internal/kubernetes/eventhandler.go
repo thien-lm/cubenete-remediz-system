@@ -32,6 +32,7 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"go.uber.org/zap"
+
 	// "google.golang.org/appengine/log"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -153,9 +154,8 @@ func (h *DrainingResourceEventHandler) OnAdd(obj interface{}) {
 		return
 	}
 	//fmt.Println("onAdd function was called", n.Name)
-	fmt.Print("xnxx")
-	go h.HandleNode(n)
-	// return
+	// go h.HandleNode(n)
+	return
 }
 
 // OnUpdate cordons and drains the updated node.
@@ -193,25 +193,15 @@ func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	// h.lock.Lock()
 	// defer h.lock.Unlock()
-	fmt.Print("event come in")
 	log := h.logger.With(zap.String("node", n.GetName()))
-
 	if !h.shouldBeHandled(n) {
 		return
 	}
-	
-	fmt.Println(vcd.GetWaitingTimeForNotReadyNode(h.clientSet))
+
 	time.Sleep(time.Duration(vcd.GetWaitingTimeForNotReadyNode(h.clientSet))*time.Second)
 
 	h.lock.Lock()
 	defer h.lock.Unlock()
-
-	// solve when CA can not remove a node
-	errorClearingUneededNode := h.forceDeleteRottenNode()
-    if errorClearingUneededNode != nil {
-		log.Info("failed to clean unneeded node, all unneeded node must be remove first")
-		return 
-	}	
 
 	currentNodeStatus, nodeNotFoundErr := h.clientSet.CoreV1().Nodes().Get(n.Name, metav1.GetOptions{})
 
@@ -222,8 +212,8 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	badConditions := h.offendingConditions(currentNodeStatus)
 	if len(badConditions) == 0 {
 		// delete the annotation
-		if _, ok := currentNodeStatus.Annotations["RepairByRebootingSucceed"]; ok {
-			delete(currentNodeStatus.Annotations, "RepairByRebootingSucceed")
+		if _, ok := currentNodeStatus.Annotations["RepairByRebootingSucceeded"]; ok {
+			delete(currentNodeStatus.Annotations, "RepairByRebootingSucceeded")
 			_, _ = h.clientSet.CoreV1().Nodes().Update(currentNodeStatus)
 			log.Info("removed rebooting annotation for this node")
 		}
@@ -236,7 +226,17 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 		return
 	}
 
-	_, ok := currentNodeStatus.Annotations["RepairByRebootingSucceed"]
+	// solve when CA can not remove a node
+	if vcd.GetReplacingPrivilege(h.clientSet) {
+		errorClearingUnneededNode := h.forceDeleteRottenNode()
+		if errorClearingUnneededNode != nil {
+			log.Info("failed to clean unneeded node, all unneeded node must be removed first")
+			return 
+	}	
+		fmt.Println("clean unneeded node successfully")
+	}
+
+	_, ok := currentNodeStatus.Annotations["RepairByRebootingSucceeded"]
 
 	if ok {
 		log.Info("This node was rebooted but the node state is still NotReady, skipping rebooting node")
@@ -248,8 +248,8 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			goVcloudClient, org, vdc, err := h.createGoVCloudClient()
 			if err != nil {
 				log.Info("failed to connect to vcd")
-				currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
-				_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+				currentNodeStatus.Annotations["RepairByRebootingSucceeded"] = "false"
+				_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceeded", "false")))
 				if err != nil {
 					panic(err)
 				}
@@ -267,8 +267,8 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 					err4 := manipulation.RebootVM(goVcloudClient, org, vdc, currentNodeStatus.Name)
 					if err4 != nil{
 						log.Info("failed to reboot node")
-						currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
-						_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+						currentNodeStatus.Annotations["RepairByRebootingSucceeded"] = "false"
+						_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceeded", "false")))
 						if err != nil {
 							panic(err)
 						}
@@ -284,8 +284,8 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			log.Info("Rebooted this node but does not make it healthy again")
 			log.Info("Node will be drained and replaced")
 			//annotate node because rebooting does not solve node not ready issue
-			currentNodeStatus.Annotations["RepairByRebootingSucceed"] = "false"
-			_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceed", "false")))
+			currentNodeStatus.Annotations["RepairByRebootingSucceeded"] = "false"
+			_, err = h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, "RepairByRebootingSucceeded", "false")))
 			if err != nil {
 				panic(err)
 			}
@@ -526,7 +526,7 @@ func (h *DrainingResourceEventHandler) shouldBeDeleted(node *core.Node, domainAP
 	    for _, condition := range node.Status.Conditions {
         if condition.Type == core.NodeReady && condition.Status != core.ConditionTrue {
             lastTransitionTime := condition.LastTransitionTime.Time
-            if time.Since(lastTransitionTime) >= 10*time.Minute && currentNodeStatus.Annotations["ActorPerformDeletion"] == "ClusterAutoScaler" &&  !clusterStatusPortal { //10 minutes is timeout to waiting node to be deleted by autoscaler
+            if time.Since(lastTransitionTime) >= 10*time.Minute && currentNodeStatus.Annotations["ActorPerformDeletion"] == "ClusterAutoScaler" &&  clusterStatusPortal { //10 minutes is timeout to waiting node to be deleted by autoscaler
                 return true
             }
         }
@@ -537,6 +537,10 @@ func (h *DrainingResourceEventHandler) shouldBeDeleted(node *core.Node, domainAP
 func (h *DrainingResourceEventHandler) forceDeleteRottenNode() error {
 	logger := h.logger.With()
 	nodeList, err := h.clientSet.CoreV1().Nodes().List(metav1.ListOptions{})	
+	if err != nil {
+			return errors.New("can not list node on this cluster")
+		}
+
 	//fetch information of cluster to scale up/down 
 	accessToken := vcd.GetAccessToken(h.clientSet)
 	vpcID := vcd.GetVPCId(h.clientSet)
@@ -544,26 +548,41 @@ func (h *DrainingResourceEventHandler) forceDeleteRottenNode() error {
 	domainAPI := utils.GetDomainApiConformEnv(callbackURL)
 	clusterIDPortal := utils.GetClusterID(h.clientSet)
 	idCluster := utils.GetIDCluster(domainAPI, vpcID, accessToken, clusterIDPortal)
-	
-	if err != nil {
-		return errors.New("can not list node on this cluster")
-	}
-
-	for i := 0; i < nodeList.Size(); i++ {
-		if h.shouldBeDeleted(&nodeList.Items[i], domainAPI, vpcID, accessToken, clusterIDPortal) {
-			h.addAnnotationForNode(&nodeList.Items[i], "ActorPerformDeletion", "NodeAutoRepair")
-			status, errSD:= api_portal.ScaleDown(time.Now() , h.clientSet, accessToken, vpcID, idCluster, clusterIDPortal, callbackURL, nodeList.Items[i].Name)
-			if !status {
-				logger.Info("Status of cluster is not suitable for scaling down")
-				break
-			}
-			if errSD != nil{
-				h.addAnnotationForNode(&nodeList.Items[i], "AutoRepairStatus", "NodeAutoRepairFailedToResolveNode")
-				return errSD
+	// clusterStatusPortal :=  utils.CheckStatusCluster(domainAPI, vpcID, accessToken, clusterIDPortal)
+	// if clusterStatusPortal {
+	logger.Info("deleting rotten node if exist")		
+	for {
+		var count int = 0
+		time.Sleep(30 * time.Second)
+		isRepairableStatus := utils.CheckStatusCluster(domainAPI, vpcID, accessToken, clusterIDPortal)
+		count = count + 1
+		if isRepairableStatus {
+			logger.Info("Status of cluster make rotten node can be removed")
+			for i := range nodeList.Items {
+				if h.shouldBeDeleted(&nodeList.Items[i], domainAPI, vpcID, accessToken, clusterIDPortal) {
+					h.addAnnotationForNode(&nodeList.Items[i], "ActorPerformDeletion", "NodeAutoRepair")
+					status, errSD:= api_portal.ScaleDown(time.Now() , h.clientSet, accessToken, vpcID, idCluster, clusterIDPortal, callbackURL, nodeList.Items[i].Name)
+					if !status {
+						logger.Info("Status of cluster is not suitable for scaling down")
+						break
+					}
+					if errSD != nil{
+						h.addAnnotationForNode(&nodeList.Items[i], "AutoRepairStatus", "NodeAutoRepairFailedToResolveNode")
+						return errSD
+					}
+					break
+				}
 			}
 			break
+		} else {
+			logger.Info("re-check cluster status after 30 seconds")
 		}
-	}
+		if count > 100 {
+			return errors.New("time out waiting for repairable status")
+			// break //break if timeout (50 minutes)
+		}
+	 }
+	
 	return nil
 }
 

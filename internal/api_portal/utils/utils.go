@@ -310,7 +310,7 @@ func CheckStatusCluster(domainAPI string, vpcID string, accessToken string, clus
 		//fmt.Println(cluster)
 		if cluster.ClusterID == clusterID {
 			logger.Info("status of cluster", "Cluster status", cluster.Status)
-			if cluster.Status != "SCALING" && cluster.Status != "SUCCEEDED"{
+			if cluster.Status != "SCALING" {
 				isSucceeded = true
 			} else if cluster.Status == "SCALING" {
 				isSucceeded = false
