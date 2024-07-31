@@ -18,23 +18,27 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/planetlabs/draino/internal/api_portal"
+	"github.com/planetlabs/draino/internal/api_portal/utils"
+	"github.com/planetlabs/draino/internal/vcd"
+	"github.com/planetlabs/draino/internal/vcd/manipulation"
+	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"go.uber.org/zap"
+	// "google.golang.org/appengine/log"
 	core "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"github.com/vmware/go-vcloud-director/v2/govcd"
-	"github.com/planetlabs/draino/internal/vcd"
-	"github.com/planetlabs/draino/internal/vcd/manipulation"
-	"k8s.io/client-go/kubernetes"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sync"
 )
 
 const (
@@ -149,8 +153,9 @@ func (h *DrainingResourceEventHandler) OnAdd(obj interface{}) {
 		return
 	}
 	//fmt.Println("onAdd function was called", n.Name)
-	// go h.HandleNode(n)
-	return
+	fmt.Print("xnxx")
+	go h.HandleNode(n)
+	// return
 }
 
 // OnUpdate cordons and drains the updated node.
@@ -188,16 +193,26 @@ func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	// h.lock.Lock()
 	// defer h.lock.Unlock()
+	fmt.Print("event come in")
 	log := h.logger.With(zap.String("node", n.GetName()))
 
 	if !h.shouldBeHandled(n) {
 		return
-	}	
-
-	time.Sleep(3*time.Minute)
+	}
+	
+	fmt.Println(vcd.GetWaitingTimeForNotReadyNode(h.clientSet))
+	time.Sleep(time.Duration(vcd.GetWaitingTimeForNotReadyNode(h.clientSet))*time.Second)
 
 	h.lock.Lock()
 	defer h.lock.Unlock()
+
+	// solve when CA can not remove a node
+	errorClearingUneededNode := h.forceDeleteRottenNode()
+    if errorClearingUneededNode != nil {
+		log.Info("failed to clean unneeded node, all unneeded node must be remove first")
+		return 
+	}	
+
 	currentNodeStatus, nodeNotFoundErr := h.clientSet.CoreV1().Nodes().Get(n.Name, metav1.GetOptions{})
 
 	if nodeNotFoundErr != nil{
@@ -282,6 +297,7 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	//if user allow us to replace node, run those code
 	if vcd.GetReplacingPrivilege(h.clientSet) {
 		// First cordon the node if it is not yet cordonned
+		h.addAnnotationForNode(n, "ActorPerformDeletion", "ClusterAutoScaler")
 		if !n.Spec.Unschedulable {
 			h.cordon(n, badConditions)
 		}
@@ -486,17 +502,83 @@ func (h *DrainingResourceEventHandler) checkNodeReadyStatusAfterRepairing(n *cor
 }
 
 func (h *DrainingResourceEventHandler) shouldBeHandled(n *core.Node) bool {
-	logger := h.logger.With(zap.String("node", n.GetName()))
+	// logger := h.logger.With(zap.String("node", n.GetName()))
 	// waitingTimeForNotReady := 3*time.Minute
     for _, condition := range n.Status.Conditions {
         if condition.Type == core.NodeReady && condition.Status != core.ConditionTrue {
             // lastTransitionTime := condition.LastTransitionTime.Time
             if  !n.Spec.Unschedulable{
-				logger.Info("node need to be handled")
+				// logger.Info("node need to be handled")
                 return true
             }
         }
     }
 	// logger.Info("node does not need to be handled")
 	return false
+}
+// check if this node can be deleted by node auto repair
+func (h *DrainingResourceEventHandler) shouldBeDeleted(node *core.Node, domainAPI string, vpcID string, accessToken string, clusterIDPortal string) bool {
+		currentNodeStatus, nodeNotFoundErr := h.clientSet.CoreV1().Nodes().Get(node.Name, metav1.GetOptions{})
+		clusterStatusPortal :=  utils.CheckStatusCluster(domainAPI, vpcID, accessToken, clusterIDPortal)
+		if nodeNotFoundErr != nil {
+			return false
+		}
+	    for _, condition := range node.Status.Conditions {
+        if condition.Type == core.NodeReady && condition.Status != core.ConditionTrue {
+            lastTransitionTime := condition.LastTransitionTime.Time
+            if time.Since(lastTransitionTime) >= 10*time.Minute && currentNodeStatus.Annotations["ActorPerformDeletion"] == "ClusterAutoScaler" &&  !clusterStatusPortal { //10 minutes is timeout to waiting node to be deleted by autoscaler
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func (h *DrainingResourceEventHandler) forceDeleteRottenNode() error {
+	logger := h.logger.With()
+	nodeList, err := h.clientSet.CoreV1().Nodes().List(metav1.ListOptions{})	
+	//fetch information of cluster to scale up/down 
+	accessToken := vcd.GetAccessToken(h.clientSet)
+	vpcID := vcd.GetVPCId(h.clientSet)
+	callbackURL := vcd.GetCallBackURL(h.clientSet)
+	domainAPI := utils.GetDomainApiConformEnv(callbackURL)
+	clusterIDPortal := utils.GetClusterID(h.clientSet)
+	idCluster := utils.GetIDCluster(domainAPI, vpcID, accessToken, clusterIDPortal)
+	
+	if err != nil {
+		return errors.New("can not list node on this cluster")
+	}
+
+	for i := 0; i < nodeList.Size(); i++ {
+		if h.shouldBeDeleted(&nodeList.Items[i], domainAPI, vpcID, accessToken, clusterIDPortal) {
+			h.addAnnotationForNode(&nodeList.Items[i], "ActorPerformDeletion", "NodeAutoRepair")
+			status, errSD:= api_portal.ScaleDown(time.Now() , h.clientSet, accessToken, vpcID, idCluster, clusterIDPortal, callbackURL, nodeList.Items[i].Name)
+			if !status {
+				logger.Info("Status of cluster is not suitable for scaling down")
+				break
+			}
+			if errSD != nil{
+				h.addAnnotationForNode(&nodeList.Items[i], "AutoRepairStatus", "NodeAutoRepairFailedToResolveNode")
+				return errSD
+			}
+			break
+		}
+	}
+	return nil
+}
+
+func (h * DrainingResourceEventHandler) addAnnotationForNode(node *core.Node, annotationKey string, annotationValue string) error {
+	logger := h.logger.With(zap.String("node", node.GetName()))
+	currentNodeStatus, nodeNotFoundErr := h.clientSet.CoreV1().Nodes().Get(node.Name, metav1.GetOptions{}) 
+	if nodeNotFoundErr != nil {
+		return errors.New("node not found")
+	}
+
+	currentNodeStatus.Annotations[annotationKey] = annotationValue
+	_, err := h.clientSet.CoreV1().Nodes().Patch(currentNodeStatus.Name, types.MergePatchType, []byte(fmt.Sprintf(`{"metadata": {"annotations": {"%s": "%s"}}}`, annotationKey, annotationValue)))
+	if err != nil {
+		logger.Info("can not assign annotation for node")
+		panic(err)
+	}
+	return nil
 }

@@ -16,6 +16,8 @@ replace k8s.io/apimachinery => k8s.io/apimachinery v0.0.0-20190817020851-f2f3a40
 require (
 	contrib.go.opencensus.io/exporter/prometheus v0.1.0
 	github.com/antonmedv/expr v1.8.8
+	github.com/go-logr/logr v1.4.1
+	github.com/go-logr/zapr v1.3.0
 	github.com/go-test/deep v1.0.1
 	github.com/julienschmidt/httprouter v1.1.0
 	github.com/oklog/run v1.0.0
@@ -23,7 +25,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	github.com/vmware/go-vcloud-director/v2 v2.25.0
 	go.opencensus.io v0.21.0
-	go.uber.org/zap v1.9.1
+	go.uber.org/zap v1.26.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.0.0-20190819141258-3544db3b9e44
@@ -40,7 +42,6 @@ require (
 	github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/evanphx/json-patch v0.0.0-20190203023257-5858425f7550 // indirect
-	github.com/go-logr/logr v1.4.1 // indirect
 	github.com/gogo/protobuf v0.0.0-20171007142547-342cbe0a0415 // indirect
 	github.com/golang/groupcache v0.0.0-20160516000752-02826c3e7903 // indirect
 	github.com/golang/protobuf v1.2.0 // indirect
@@ -52,7 +53,7 @@ require (
 	github.com/imdario/mergo v0.3.5 // indirect
 	github.com/json-iterator/go v0.0.0-20180701071628-ab8a2e0c74be // indirect
 	github.com/kr/pretty v0.2.1 // indirect
-	github.com/kr/text v0.1.0 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.1 // indirect
@@ -66,8 +67,7 @@ require (
 	github.com/prometheus/common v0.0.0-20181126121408-4724e9255275 // indirect
 	github.com/prometheus/procfs v0.0.0-20181204211112-1dc9a6cbc91a // indirect
 	github.com/spf13/pflag v1.0.1 // indirect
-	go.uber.org/atomic v1.3.2 // indirect
-	go.uber.org/multierr v1.1.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/crypto v0.18.0 // indirect
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a // indirect
 	golang.org/x/net v0.20.0 // indirect
